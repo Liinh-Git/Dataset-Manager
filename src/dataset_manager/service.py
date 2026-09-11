@@ -4,6 +4,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import shutil
 import tarfile
 import threading
@@ -11,7 +12,7 @@ import urllib.request
 from collections import deque
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -24,7 +25,12 @@ from dataset_manager.hashing import canonical_json_bytes, sha256_bytes
 from dataset_manager.importer import DatasetImporter
 from dataset_manager.preprocessing import Preprocessor
 from dataset_manager.schemas import CreateBuildRequest, DatasetBuildState
-from dataset_manager.storage import DatasetStorage, PublishedDatasetBuild
+from dataset_manager.storage import (
+    ArtifactStore,
+    HuggingFaceArtifactStore,
+    LocalArtifactStore,
+    PublishedDatasetBuild,
+)
 
 _CIFAR10_BINARY_URL = "https://www.cs.toronto.edu/~kriz/cifar-10-binary.tar.gz"
 _CIFAR10_BINARY_ARCHIVE_BYTES = 170_052_171
@@ -61,15 +67,35 @@ class BuildExecutionResult:
     raw_workspace: Path | None = None
 
 
+DURABLE_RECORD_SCHEMA_VERSION = 1
+
+
+def _hash_idempotency_key(key: str) -> str:
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+def _sanitize_error(error: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not error:
+        return None
+    sanitized = dict(error)
+    if "message" in sanitized and isinstance(sanitized["message"], str):
+        msg = re.sub(r"[A-Za-z]:\\[^\s\"\'\)]+", "<path>", sanitized["message"])
+        msg = re.sub(r"/(?:home|tmp|Users)/[^ \t\n\r\"\'\)]+", "<path>", msg)
+        sanitized["message"] = msg
+    return sanitized
+
+
 @dataclass(slots=True)
 class _BuildRecord:
     dataset_build_id: str
     request: dict[str, Any]
     request_fingerprint: str
-    idempotency_key: str
+    idempotency_key_hash: str
     state: str
     created_at: str
     updated_at: str
+    schema_version: int = DURABLE_RECORD_SCHEMA_VERSION
+    idempotency_key: str | None = None
     started_at: str | None = None
     completed_at: str | None = None
     current_stage: str | None = None
@@ -85,6 +111,83 @@ class _BuildRecord:
     purge_command_id: str | None = None
 
 
+def serialize_durable_record(record: _BuildRecord, *, is_remote: bool = False) -> dict[str, Any]:
+    data: dict[str, Any] = {
+        "schema_version": record.schema_version,
+        "dataset_build_id": record.dataset_build_id,
+        "request": record.request,
+        "request_fingerprint": record.request_fingerprint,
+        "idempotency_key_hash": record.idempotency_key_hash,
+        "state": record.state,
+        "created_at": record.created_at,
+        "updated_at": record.updated_at,
+        "started_at": record.started_at,
+        "completed_at": record.completed_at,
+        "current_stage": record.current_stage,
+        "progress": record.progress,
+        "dataset_manifest_hash": record.dataset_manifest_hash,
+        "manifest_uri": record.manifest_uri,
+        "artifact_base_url": record.artifact_base_url,
+        "sample_count": record.sample_count,
+        "registration_id": record.registration_id,
+        "registration_acknowledged_at": record.registration_acknowledged_at,
+        "purge_command_id": record.purge_command_id,
+    }
+    if not is_remote:
+        if record.raw_workspace is not None:
+            data["raw_workspace"] = record.raw_workspace
+        if record.idempotency_key is not None:
+            data["idempotency_key"] = record.idempotency_key
+    if record.error is not None:
+        data["error"] = _sanitize_error(record.error)
+    return data
+
+
+def deserialize_durable_record(data: dict[str, Any]) -> _BuildRecord:
+    schema_version = data.get("schema_version", 0)
+    if schema_version > DURABLE_RECORD_SCHEMA_VERSION:
+        raise ValueError(
+            f"Unsupported durable record schema version: {schema_version} "
+            f"(maximum supported is {DURABLE_RECORD_SCHEMA_VERSION})"
+        )
+
+    raw_key = data.get("idempotency_key")
+    idempotency_key_hash = data.get("idempotency_key_hash")
+    if not idempotency_key_hash:
+        if raw_key:
+            idempotency_key_hash = _hash_idempotency_key(raw_key)
+        else:
+            raise ValueError(
+                f"Record for build {data.get('dataset_build_id')} has neither "
+                "idempotency_key_hash nor legacy idempotency_key"
+            )
+
+    return _BuildRecord(
+        dataset_build_id=data["dataset_build_id"],
+        request=data["request"],
+        request_fingerprint=data["request_fingerprint"],
+        idempotency_key_hash=idempotency_key_hash,
+        state=data["state"],
+        created_at=data["created_at"],
+        updated_at=data["updated_at"],
+        schema_version=DURABLE_RECORD_SCHEMA_VERSION,
+        idempotency_key=raw_key,
+        started_at=data.get("started_at"),
+        completed_at=data.get("completed_at"),
+        current_stage=data.get("current_stage"),
+        progress=data.get("progress"),
+        dataset_manifest_hash=data.get("dataset_manifest_hash"),
+        manifest_uri=data.get("manifest_uri"),
+        artifact_base_url=data.get("artifact_base_url"),
+        sample_count=data.get("sample_count"),
+        registration_id=data.get("registration_id"),
+        registration_acknowledged_at=data.get("registration_acknowledged_at"),
+        raw_workspace=data.get("raw_workspace"),
+        error=data.get("error"),
+        purge_command_id=data.get("purge_command_id"),
+    )
+
+
 def _now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -92,7 +195,7 @@ def _now() -> str:
 class DatasetBuildPipeline:
     """Allowlisted CIFAR-10 source acquisition and deterministic artifact build."""
 
-    def __init__(self, config: DatasetManagerConfig, storage: DatasetStorage):
+    def __init__(self, config: DatasetManagerConfig, storage: ArtifactStore):
         self._config = config
         self._storage = storage
 
@@ -321,7 +424,17 @@ class DatasetService:
         start_worker: bool = True,
     ):
         self.config = config
-        self.storage = DatasetStorage(Path(config.store_dir))
+        if config.storage_backend == "huggingface":
+            if not config.hf_repo_id:
+                raise ValueError("hf_repo_id is required when storage_backend is huggingface")
+            self.storage: ArtifactStore = HuggingFaceArtifactStore(
+                local_root=Path(config.store_dir),
+                repo_id=config.hf_repo_id,
+                token=config.hf_token or "",
+                branch=config.hf_branch,
+            )
+        else:
+            self.storage = LocalArtifactStore(Path(config.store_dir))
         self._metadata = Path(config.store_dir).resolve() / ".service" / "builds"
         self._metadata.mkdir(parents=True, exist_ok=True)
         self._executor = executor or DatasetBuildPipeline(config, self.storage)
@@ -373,26 +486,17 @@ class DatasetService:
         }
 
     def _probe_storage_writable(self) -> bool:
-        """Cheap local writability probe; never holds the service lock."""
-        store = Path(self.config.store_dir)
-        probe = store / f".health-probe-{uuid4().hex}"
-        try:
-            store.mkdir(parents=True, exist_ok=True)
-            probe.write_bytes(b"")
-            return True
-        except OSError:
-            return False
-        finally:
-            with contextlib.suppress(OSError):
-                probe.unlink(missing_ok=True)
+        """Storage writability probe; never holds the service lock."""
+        return self.storage.probe_writable()
 
     def submit(self, request: dict[str, Any], idempotency_key: str) -> dict[str, object]:
         if not idempotency_key:
             raise DatasetServiceError("INVALID_REQUEST", "Missing Idempotency-Key", 400)
+        key_hash = _hash_idempotency_key(idempotency_key)
         frozen_request = json.loads(canonical_json_bytes(request))
         fingerprint = sha256_bytes(canonical_json_bytes(frozen_request))
         with self._condition:
-            if existing_id := self._idempotency.get(idempotency_key):
+            if existing_id := self._idempotency.get(key_hash):
                 existing = self._records[existing_id]
                 if existing.request_fingerprint != fingerprint:
                     raise DatasetServiceError(
@@ -411,16 +515,17 @@ class DatasetService:
             dataset_build_id = str(uuid4())
             now = _now()
             record = _BuildRecord(
-                dataset_build_id,
-                frozen_request,
-                fingerprint,
-                idempotency_key,
-                DatasetBuildState.CREATED,
-                now,
-                now,
+                dataset_build_id=dataset_build_id,
+                request=frozen_request,
+                request_fingerprint=fingerprint,
+                idempotency_key_hash=key_hash,
+                state=DatasetBuildState.CREATED,
+                created_at=now,
+                updated_at=now,
+                idempotency_key=idempotency_key,
             )
             self._records[dataset_build_id] = record
-            self._idempotency[idempotency_key] = dataset_build_id
+            self._idempotency[key_hash] = dataset_build_id
             self._queue.append(dataset_build_id)
             if self._active is not None or len(self._queue) > 1:
                 record.state = DatasetBuildState.QUEUED
@@ -560,7 +665,12 @@ class DatasetService:
             )
             if record.state not in allowed:
                 raise DatasetServiceError("BUILD_NOT_READY", "Artifact is not visible", 409)
-        published = self.storage.load(dataset_build_id)
+            manifest_hash = record.dataset_manifest_hash
+            if not manifest_hash:
+                raise DatasetServiceError(
+                    "ARTIFACT_NOT_FOUND", "Dataset Build manifest hash is missing", 404
+                )
+        published = self.storage.load(dataset_build_id, expected_manifest_hash=manifest_hash)
         if shard_id is None:
             path = published.manifest_path
             digest = published.dataset_manifest_hash
@@ -662,12 +772,17 @@ class DatasetService:
     def _load(self) -> None:
         queued: list[_BuildRecord] = []
         deleting: list[_BuildRecord] = []
-        for path in self._metadata.glob("*.json"):
-            value = json.loads(path.read_bytes())
-            record = _BuildRecord(**value)
+        loaded_data = self.storage.load_records()
+        for raw_data in loaded_data:
+            legacy = raw_data.get(
+                "schema_version", 0
+            ) < DURABLE_RECORD_SCHEMA_VERSION or not raw_data.get("idempotency_key_hash")
+            record = deserialize_durable_record(raw_data)
             self._records[record.dataset_build_id] = record
-            self._idempotency[record.idempotency_key] = record.dataset_build_id
+            self._idempotency[record.idempotency_key_hash] = record.dataset_build_id
             state = DatasetBuildState(record.state)
+            if legacy:
+                self._persist(record)
             if state in (DatasetBuildState.CREATED, DatasetBuildState.QUEUED):
                 record.state = DatasetBuildState.QUEUED
                 queued.append(record)
@@ -694,7 +809,10 @@ class DatasetService:
                 # A missing tree means the prior physical removal completed before
                 # the DELETED metadata write.
                 try:
-                    self.storage.load(record.dataset_build_id)
+                    self.storage.load(
+                        record.dataset_build_id,
+                        expected_manifest_hash=record.dataset_manifest_hash,
+                    )
                 except ValueError:
                     pass
                 else:
@@ -705,14 +823,9 @@ class DatasetService:
             self._persist(record)
 
     def _persist(self, record: _BuildRecord) -> None:
-        destination = self._metadata / f"{record.dataset_build_id}.json"
-        temporary = destination.with_suffix(f".{uuid4().hex}.tmp")
-        content = canonical_json_bytes(asdict(record))
-        with temporary.open("xb") as stream:
-            stream.write(content)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, destination)
+        is_remote = self.config.storage_backend == "huggingface"
+        data = serialize_durable_record(record, is_remote=is_remote)
+        self.storage.persist_record(data)
 
     def _cleanup_raw(self, record: _BuildRecord) -> None:
         if not record.raw_workspace:

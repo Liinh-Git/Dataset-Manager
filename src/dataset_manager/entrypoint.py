@@ -27,6 +27,22 @@ def main() -> None:
     parser.add_argument("--queue-capacity", type=int, default=8)
     parser.add_argument("--public-base-url", default=default_public_url)
     parser.add_argument("--log-level", default=os.environ.get("LOG_LEVEL", "INFO"))
+    parser.add_argument(
+        "--storage-backend",
+        choices=["local", "huggingface"],
+        default=os.environ.get("DATASET_STORAGE_BACKEND", "local"),
+        help="Durable storage backend ('local' or 'huggingface')",
+    )
+    parser.add_argument(
+        "--hf-repo-id",
+        default=os.environ.get("HF_REPO_ID"),
+        help="Hugging Face Dataset repository ID (required for huggingface backend)",
+    )
+    parser.add_argument(
+        "--hf-branch",
+        default=os.environ.get("HF_BRANCH", "main"),
+        help="Hugging Face target branch (default: 'main')",
+    )
     args = parser.parse_args()
 
     public_url = args.public_base_url or f"http://{args.host}:{args.port}"
@@ -38,6 +54,10 @@ def main() -> None:
         queue_capacity=args.queue_capacity,
         public_base_url=public_url,
         log_level=args.log_level.upper(),
+        storage_backend=args.storage_backend,
+        hf_repo_id=args.hf_repo_id,
+        hf_token=os.environ.get("HF_TOKEN"),
+        hf_branch=args.hf_branch,
     )
     uvicorn.run(
         create_app(config),
