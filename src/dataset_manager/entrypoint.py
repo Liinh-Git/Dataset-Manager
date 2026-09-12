@@ -10,6 +10,12 @@ from dataset_manager.config import DatasetManagerConfig
 
 
 def main() -> None:
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass
+
     default_host = os.environ.get("HOST", "0.0.0.0")
     default_port = int(os.environ.get("PORT", "9200"))
     default_store = os.environ.get("STORE_DIR", "var/datasets")
