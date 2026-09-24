@@ -21,6 +21,9 @@ export HF_BRANCH=main
 uv run dataset-manager --host 127.0.0.1 --port 9200
 ```
 
+V1 assumes Dataset Manager itself is local/private. It does not implement an
+application authentication layer.
+
 ## Storage Backends
 Dataset Manager supports two durable storage backends:
 1. **Local Filesystem (`local`, default)**:
@@ -32,6 +35,20 @@ Dataset Manager supports two durable storage backends:
    - Local directory is used as an ephemeral staging workspace and read-through verified cache.
    - On cache miss, manifests and NPZ batches are fetched on-demand from the remote repo with cryptographic SHA-256 validation against the root manifest hash chain.
    - `HF_TOKEN` must be provided via environment variable only (never via CLI flags).
+   - `HF_TOKEN` is used only by Dataset Manager to publish/write. Workers do not
+     need it when the repository is publicly readable.
+   - For this backend, Dataset Manager publishes the Hugging Face `resolve` URL
+     as `artifact_base_url`; that provider-specific construction stays inside
+     `HuggingFaceArtifactStore`. Manifest-relative shard and batch paths identify
+     the files beneath that origin.
+
+The domain requirement is a durable `ArtifactStore`; Hugging Face is one current
+implementation and deployment choice. Current PBL4 `dev` does not yet implement
+direct-HF manifest-relative provisioning, all-shards caching, or `work_units[]`.
+
+`PUBLIC_BASE_URL` remains the local-storage fallback: when artifacts are served
+by Dataset Manager itself, it forms the advertised `/artifacts/v1/...` URLs. It
+is not a WAN or production-mode requirement for the Hugging Face backend.
 
 ## Running Tests
 ```bash
@@ -47,7 +64,13 @@ uv run python scripts/real_hf_smoke.py
 - **Health Check Path**: `/healthz`
 - **Container Durability**:
   - With `DATASET_STORAGE_BACKEND=huggingface`, published builds survive Render container restarts without requiring a paid Persistent Disk ($0.25/GB/mo).
-- **512 MB RAM Preprocessing Limitation**:
-  - Hugging Face storage solves artifact **durability**, but does **NOT** resolve the in-memory footprint of full CIFAR-10 static preprocessing.
-  - The current in-memory preprocessing pipeline requires ~614 MB RAM to unpack, normalize, and partition all 50,000 CIFAR-10 images at once.
-  - Running a full CIFAR-10 build on Render Starter (512 MB RAM) will encounter an Out Of Memory (OOM) error until a streaming/chunked preprocessor is implemented.
+- **Bounded-memory preprocessing**:
+  - CIFAR-10 source files are validated and memory-mapped.
+  - Static normalization materializes one physical batch at a time, avoiding a
+    full-dataset `float32` duplicate while preserving deterministic artifacts.
+- **Physical batches**:
+  - Each shard is sliced into configured-size batches plus at most one smaller
+    tail, with no padding, duplication, or dropped samples.
+  - `CNN_IMAGE_CLASSIFICATION_V1` currently requires three shards and equal
+    batch counts; incompatible configurations are rejected after generic
+    batching rather than having their batch sizes smeared.

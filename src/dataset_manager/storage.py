@@ -10,9 +10,11 @@ import json
 import logging
 import os
 import shutil
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
+from urllib.parse import quote
 from uuid import uuid4
 
 import numpy as np
@@ -22,7 +24,8 @@ from dataset_manager.config import DatasetBuildConfig
 from dataset_manager.hashing import canonical_json_bytes, sha256_bytes, sha256_file
 from dataset_manager.manifest import DatasetManifest, ManifestBuilder
 from dataset_manager.partitioner import Partitioner
-from dataset_manager.preprocessing import Samples
+from dataset_manager.preprocessing import SampleSource
+from dataset_manager.profiles import validate_materialized_batch_counts
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +36,14 @@ class PublishedDatasetBuild:
     dataset_manifest_hash: str
     directory: Path
     manifest_path: Path
+    artifact_base_url: str | None = None
+    root_manifest_path: str | None = None
+
+    def __post_init__(self) -> None:
+        if (self.artifact_base_url is None) != (self.root_manifest_path is None):
+            raise ValueError(
+                "Artifact base URL and root manifest path must be provided together"
+            )
 
     @property
     def lifecycle_state(self) -> str:
@@ -44,7 +55,7 @@ class ArtifactStore(Protocol):
     """Abstract durable storage contract for dataset artifacts and service records."""
 
     def materialize(
-        self, config: DatasetBuildConfig, samples: Samples
+        self, config: DatasetBuildConfig, samples: SampleSource
     ) -> PublishedDatasetBuild: ...
 
     def load(
@@ -118,18 +129,10 @@ class LocalArtifactStore:
             stream.flush()
             os.fsync(stream.fileno())
 
-    def materialize(self, config: DatasetBuildConfig, samples: Samples) -> PublishedDatasetBuild:
-        if (
-            samples.x.dtype != np.float32
-            or samples.x.ndim != 4
-            or tuple(samples.x.shape[1:]) != config.input_shape
-            or samples.y.dtype != np.int64
-            or samples.sample_ids.dtype != np.int64
-            or samples.y.shape != (len(samples.x),)
-            or samples.sample_ids.shape != (len(samples.x),)
-            or len(np.unique(samples.sample_ids)) != len(samples.x)
-            or not len(samples.x)
-        ):
+    def materialize(
+        self, config: DatasetBuildConfig, samples: SampleSource
+    ) -> PublishedDatasetBuild:
+        if samples.sample_count <= 0 or tuple(samples.input_shape) != config.input_shape:
             raise ValueError("Invalid canonical sample collection")
         self._root.mkdir(parents=True, exist_ok=True)
         self._temporary_root.mkdir(exist_ok=True)
@@ -138,9 +141,13 @@ class LocalArtifactStore:
         workspace.mkdir()
         try:
             partitions = Partitioner().partition(
-                len(samples.x), config.shard_count, config.partition_seed
+                samples.sample_count, config.shard_count, config.partition_seed
             )
+            if any(not len(partition) for partition in partitions):
+                raise ValueError("Dataset Build configuration would create an empty shard")
             physical = BatchBuilder().split(partitions, config.batch_size)
+            batch_counts = tuple(len(shard) for shard in physical)
+            validate_materialized_batch_counts(config.profile, batch_counts)
             manifest_builder = ManifestBuilder()
             shard_entries = []
             for shard_id, batches in enumerate(physical):
@@ -168,7 +175,7 @@ class LocalArtifactStore:
                     }
                 )
             root = manifest_builder.root(
-                config, len(samples.x), len(physical[0]), tuple(shard_entries)
+                config, samples.sample_count, batch_counts[0], tuple(shard_entries)
             )
             self._write(workspace / "dataset-manifest.json", root.content)
             self._verify_tree(workspace, root.sha256)
@@ -442,6 +449,7 @@ class HuggingFaceArtifactStore:
         self._repo_id = repo_id
         self._token = token
         self._branch = branch
+        self._cache_lock = threading.RLock()
         if api is not None:
             self._api = api
         else:
@@ -472,7 +480,9 @@ class HuggingFaceArtifactStore:
             )
             raise ValueError(msg)
 
-    def materialize(self, config: DatasetBuildConfig, samples: Samples) -> PublishedDatasetBuild:
+    def materialize(
+        self, config: DatasetBuildConfig, samples: SampleSource
+    ) -> PublishedDatasetBuild:
         """Materialize locally, upload complete tree to Hugging Face, verify remote, cache."""
         # Compose LocalArtifactStore for deterministic local generation
         published = self._local_store.materialize(config, samples)
@@ -491,7 +501,7 @@ class HuggingFaceArtifactStore:
 
         # Remote verification: ensure uploaded files match byte size and sha256
         self._verify_remote_build(config.dataset_build_id, published.dataset_manifest_hash)
-        return published
+        return self._with_artifact_location(published)
 
     def load(
         self, dataset_build_id: str, expected_manifest_hash: str | None = None
@@ -504,31 +514,49 @@ class HuggingFaceArtifactStore:
         local_dir = self._root / dir_key
         manifest_path = local_dir / "dataset-manifest.json"
 
-        if manifest_path.is_file():
-            raw = manifest_path.read_bytes()
-            if sha256_bytes(raw) == expected_manifest_hash:
-                manifest = DatasetManifest(raw)
-                if manifest.value.get("dataset_build_id") == dataset_build_id:
-                    return PublishedDatasetBuild(
-                        dataset_build_id, expected_manifest_hash, local_dir, manifest_path
-                    )
+        with self._cache_lock:
+            if manifest_path.is_file():
+                raw = manifest_path.read_bytes()
+                if sha256_bytes(raw) == expected_manifest_hash:
+                    manifest = DatasetManifest(raw)
+                    if manifest.value.get("dataset_build_id") == dataset_build_id:
+                        return self._with_artifact_location(
+                            PublishedDatasetBuild(
+                                dataset_build_id, expected_manifest_hash, local_dir, manifest_path
+                            )
+                        )
 
-        # Cache miss or invalid cache: fetch from remote Hugging Face repo
-        remote_path = f"dataset-builds/{dataset_build_id}/dataset-manifest.json"
-        raw = self._download_remote_file(remote_path)
-        if sha256_bytes(raw) != expected_manifest_hash:
-            raise ValueError(
-                f"Corrupted root manifest for build {dataset_build_id} on remote: "
-                f"expected {expected_manifest_hash}, got {sha256_bytes(raw)}"
+            # Cache miss or invalid cache: fetch from remote Hugging Face repo.
+            remote_path = f"dataset-builds/{dataset_build_id}/dataset-manifest.json"
+            raw = self._download_remote_file(remote_path)
+            if sha256_bytes(raw) != expected_manifest_hash:
+                raise ValueError(
+                    f"Corrupted root manifest for build {dataset_build_id} on remote: "
+                    f"expected {expected_manifest_hash}, got {sha256_bytes(raw)}"
+                )
+            manifest = DatasetManifest(raw)
+            if manifest.value.get("dataset_build_id") != dataset_build_id:
+                raise ValueError("Dataset Build identity mismatch in remote manifest")
+
+            self._atomic_cache_write(manifest_path, raw)
+            return self._with_artifact_location(
+                PublishedDatasetBuild(
+                    dataset_build_id, expected_manifest_hash, local_dir, manifest_path
+                )
             )
-        manifest = DatasetManifest(raw)
-        if manifest.value.get("dataset_build_id") != dataset_build_id:
-            raise ValueError("Dataset Build identity mismatch in remote manifest")
 
-        manifest_path.parent.mkdir(parents=True, exist_ok=True)
-        manifest_path.write_bytes(raw)
+    def _with_artifact_location(self, published: PublishedDatasetBuild) -> PublishedDatasetBuild:
+        repo = quote(self._repo_id, safe="/")
+        revision = quote(self._branch, safe="")
+        build = quote(published.dataset_build_id, safe="")
+        base = f"https://huggingface.co/datasets/{repo}/resolve/{revision}/dataset-builds/{build}"
         return PublishedDatasetBuild(
-            dataset_build_id, expected_manifest_hash, local_dir, manifest_path
+            published.dataset_build_id,
+            published.dataset_manifest_hash,
+            published.directory,
+            published.manifest_path,
+            base,
+            "dataset-manifest.json",
         )
 
     def verify(self, published: PublishedDatasetBuild) -> DatasetManifest:
@@ -537,6 +565,10 @@ class HuggingFaceArtifactStore:
 
     def resolve_artifact(self, published: PublishedDatasetBuild, relative: str) -> Path:
         """Resolve artifact relative path with cache verification and remote refetch."""
+        with self._cache_lock:
+            return self._resolve_artifact_locked(published, relative)
+
+    def _resolve_artifact_locked(self, published: PublishedDatasetBuild, relative: str) -> Path:
         local_path = self._local_store._safe(published.directory, relative)
         root_data = json.loads(published.manifest_path.read_bytes())
 
@@ -554,7 +586,7 @@ class HuggingFaceArtifactStore:
             batch_found = False
             for shard_ref in root_data.get("shards", []):
                 shard_rel = shard_ref.get("relative_shard_manifest_path")
-                shard_path = self.resolve_artifact(published, shard_rel)
+                shard_path = self._resolve_artifact_locked(published, shard_rel)
                 shard_data = json.loads(shard_path.read_bytes())
                 for batch_entry in shard_data.get("batches", []):
                     if batch_entry.get("relative_filename") == relative:
@@ -595,9 +627,21 @@ class HuggingFaceArtifactStore:
                 f"expected {expected_sha256}, got {sha256_bytes(content)}"
             )
 
-        local_path.parent.mkdir(parents=True, exist_ok=True)
-        local_path.write_bytes(content)
+        self._atomic_cache_write(local_path, content)
         return local_path
+
+    @staticmethod
+    def _atomic_cache_write(path: Path, content: bytes) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+        try:
+            with temporary.open("xb") as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def purge(self, dataset_build_id: str, dataset_manifest_hash: str) -> None:
         """Purge remote artifact folder and local cache for the specified build.

@@ -131,6 +131,11 @@ def test_huggingface_cold_start_recovery_and_serving(tmp_path: Path):
         assert reg_status["state"] == "REGISTERING"
         manifest_hash = str(reg_status["dataset_manifest_hash"])
         assert manifest_hash
+        expected_origin = (
+            f"https://huggingface.co/datasets/test/repo/resolve/main/dataset-builds/{build_id}"
+        )
+        assert reg_status["artifact_base_url"] == expected_origin
+        assert reg_status["manifest_uri"] == f"{expected_origin}/dataset-manifest.json"
 
         # Complete lifecycle to READY via acknowledge_registration
         ack_res = service1.acknowledge_registration(

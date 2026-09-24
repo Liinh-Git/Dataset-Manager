@@ -23,7 +23,8 @@ from pydantic import ValidationError
 from dataset_manager.config import DatasetBuildConfig, DatasetManagerConfig
 from dataset_manager.hashing import canonical_json_bytes, sha256_bytes
 from dataset_manager.importer import DatasetImporter
-from dataset_manager.preprocessing import Preprocessor
+from dataset_manager.preprocessing import PreprocessedSampleSource, Preprocessor
+from dataset_manager.profiles import resolve_profile
 from dataset_manager.schemas import CreateBuildRequest, DatasetBuildState
 from dataset_manager.storage import (
     ArtifactStore,
@@ -220,28 +221,32 @@ class DatasetBuildPipeline:
         files = tuple(
             extracted / "cifar-10-batches-bin" / f"data_batch_{index}.bin" for index in range(1, 6)
         )
-        imported = DatasetImporter().import_cifar10_binary(files)
+        imported = DatasetImporter().open_cifar10_binary(files)
         update(DatasetBuildState.VALIDATING, "VALIDATING_SOURCE", 0.25)
         if request["source"]["version"] != "binary-v1":
             raise ValueError("Unsupported CIFAR-10 source version")
         update(DatasetBuildState.PREPROCESSING, "STATIC_PREPROCESSING", 0.4)
         normalization = request["normalization"]
-        samples = Preprocessor(
-            tuple(request["input_shape"]),
-            10,
-            tuple(normalization["mean"]),
-            tuple(normalization["std"]),
-        ).transform(imported.x, imported.y)
+        profile = resolve_profile(request["profile"])
+        samples = PreprocessedSampleSource(
+            imported,
+            Preprocessor(
+                tuple(request["input_shape"]),
+                profile.num_classes,
+                tuple(normalization["mean"]),
+                tuple(normalization["std"]),
+            ),
+        )
         build_config = DatasetBuildConfig(
             1,
             dataset_build_id,
             "cifar10",
             "CIFAR-10",
             request["profile"],
-            "image_classification",
+            profile.task_type,
             tuple(request["input_shape"]),
             "float32",
-            10,
+            profile.num_classes,
             {
                 "channel_order": "NCHW",
                 "scale": "uint8_to_unit",
@@ -723,11 +728,16 @@ class DatasetService:
                 manifest = self.storage.verify(result.published).value
                 with self._condition:
                     record.dataset_manifest_hash = result.published.dataset_manifest_hash
-                    record.artifact_base_url = (
-                        f"{self.config.public_base_url.rstrip('/')}"
-                        f"/artifacts/v1/dataset-builds/{dataset_build_id}"
-                    )
-                    record.manifest_uri = f"{record.artifact_base_url}/manifest.json"
+                    if result.published.artifact_base_url:
+                        record.artifact_base_url = result.published.artifact_base_url
+                        root_manifest_path = result.published.root_manifest_path
+                    else:
+                        record.artifact_base_url = (
+                            f"{self.config.public_base_url.rstrip('/')}"
+                            f"/artifacts/v1/dataset-builds/{dataset_build_id}"
+                        )
+                        root_manifest_path = "manifest.json"
+                    record.manifest_uri = f"{record.artifact_base_url}/{root_manifest_path}"
                     record.sample_count = manifest["sample_count"]
                     if result.raw_workspace is not None:
                         workspace = result.raw_workspace.resolve()
@@ -882,7 +892,7 @@ class DatasetService:
             "shard_count": request["shard_count"],
             "batch_size": request["batch_size"],
             "profile": request["profile"],
-            "task_type": "image_classification",
+            "task_type": resolve_profile(request["profile"]).task_type,
             "error": record.error,
             "registration_id": record.registration_id,
             "registration_acknowledged_at": record.registration_acknowledged_at,

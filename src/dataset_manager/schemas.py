@@ -6,6 +6,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from dataset_manager.profiles import resolve_profile
+
 
 class DatasetBuildState(StrEnum):
     CREATED = "CREATED"
@@ -58,8 +60,7 @@ class CreateBuildRequest(StrictModel):
 
     @model_validator(mode="after")
     def validate_profile(self):
-        if self.input_shape != (3, 32, 32) or self.shard_count != 3:
-            raise ValueError("CNN_IMAGE_CLASSIFICATION_V1 requires [3,32,32] and 3 shards")
+        resolve_profile(self.profile).validate_request(self.input_shape, self.shard_count)
         return self
 
 

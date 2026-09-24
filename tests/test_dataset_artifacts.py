@@ -99,23 +99,78 @@ def test_partition_is_deterministic_disjoint_and_complete(n):
     assert max(map(len, first)) - min(map(len, first)) <= 1
 
 
-def test_equal_k_quotient_remainder_has_no_padding():
+def test_fixed_size_batches_have_only_one_possible_tail():
     partitions = (
         np.arange(0, 5, dtype=np.int64),
         np.arange(5, 9, dtype=np.int64),
         np.arange(9, 13, dtype=np.int64),
     )
     batches = BatchBuilder().split(partitions, 2)
-    assert [list(map(len, shard)) for shard in batches] == [[2, 2, 1], [2, 1, 1], [2, 1, 1]]
-    assert all(len(shard) == 3 for shard in batches)
+    assert [list(map(len, shard)) for shard in batches] == [[2, 2, 1], [2, 2], [2, 2]]
     assert sorted(np.concatenate([batch for shard in batches for batch in shard])) == list(
         range(13)
     )
     for invalid in (0, -1, True):
         with pytest.raises(ValueError):
             BatchBuilder().split(partitions, invalid)
-    with pytest.raises(ValueError):
-        BatchBuilder().split((np.array([0, 1]), np.array([2])), 1)
+    uneven = BatchBuilder().split((np.array([0, 1]), np.array([2])), 1)
+    assert [len(shard) for shard in uneven] == [2, 1]
+    with_empty = BatchBuilder().split(
+        (np.array([], dtype=np.int64), np.array([0, 1], dtype=np.int64)), 2
+    )
+    assert with_empty[0] == ()
+    assert [batch.tolist() for batch in with_empty[1]] == [[0, 1]]
+
+
+@pytest.mark.parametrize("batch_size", [32, 64, 128, 256])
+def test_cifar_scale_fixed_size_batching_is_complete_and_deterministic(batch_size):
+    partitions = Partitioner().partition(50_000, 3, 42)
+    first = BatchBuilder().split(partitions, batch_size)
+    second = BatchBuilder().split(partitions, batch_size)
+
+    assert all(
+        np.array_equal(left, right)
+        for left_shard, right_shard in zip(first, second, strict=True)
+        for left, right in zip(left_shard, right_shard, strict=True)
+    )
+    flat = np.concatenate([batch for shard in first for batch in shard])
+    assert len(flat) == 50_000
+    assert len(np.unique(flat)) == 50_000
+    assert sorted(flat) == list(range(50_000))
+    for partition, shard in zip(partitions, first, strict=True):
+        assert all(len(batch) == batch_size for batch in shard[:-1])
+        assert 0 < len(shard[-1]) <= batch_size
+        assert sum(len(batch) == batch_size for batch in shard) == len(partition) // batch_size
+        assert sum(map(len, shard)) == len(partition)
+        assert sum(len(batch) < batch_size for batch in shard) <= 1
+    if batch_size == 128:
+        assert sum(len(batch) == 127 for shard in first for batch in shard) <= 1
+
+
+@pytest.mark.parametrize("shard_count", [1, 2, 3, 4, 8])
+def test_fixed_size_batching_is_generic_over_shard_count(shard_count):
+    sample_count = 37
+    batch_size = 5
+    partitions = Partitioner().partition(sample_count, shard_count, 7)
+    shards = BatchBuilder().split(partitions, batch_size)
+    flat = np.concatenate([batch for shard in shards for batch in shard])
+
+    assert sorted(flat) == list(range(sample_count))
+    assert len(np.unique(flat)) == sample_count
+    for partition, shard in zip(partitions, shards, strict=True):
+        assert all(len(batch) == batch_size for batch in shard[:-1])
+        assert 0 < len(shard[-1]) <= batch_size
+        assert sum(map(len, shard)) == len(partition)
+
+
+def test_profile_rejects_unequal_batch_counts_without_smearing(tmp_path):
+    with pytest.raises(ValueError, match="requires equal batch_count_per_shard"):
+        DatasetStorage(tmp_path).materialize(config(), samples(7))
+
+
+def test_materialization_rejects_configuration_that_creates_empty_shard(tmp_path):
+    with pytest.raises(ValueError, match="would create an empty shard"):
+        DatasetStorage(tmp_path).materialize(config(), samples(2))
 
 
 def test_build_tree_is_deterministic_verified_and_registering(tmp_path):
@@ -134,6 +189,13 @@ def test_build_tree_is_deterministic_verified_and_registering(tmp_path):
     assert root["batch_count_per_shard"] == 2
     assert [s["sample_count"] for s in root["shards"]] == [4, 3, 3]
     assert all(s["batch_count"] == 2 for s in root["shards"])
+    for shard_ref in root["shards"]:
+        shard_path = first.directory / shard_ref["relative_shard_manifest_path"]
+        shard = DatasetManifest(shard_path.read_bytes()).value
+        sizes = [entry["sample_count"] for entry in shard["batches"]]
+        assert all(size == root["batch_size"] for size in sizes[:-1])
+        assert 0 < sizes[-1] <= root["batch_size"]
+        assert sum(size < root["batch_size"] for size in sizes) <= 1
     again = DatasetStorage(tmp_path / "a").materialize(config(), samples())
     assert again == first
     assert not list((tmp_path / "a" / ".tmp").iterdir())

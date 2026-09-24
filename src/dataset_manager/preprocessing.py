@@ -1,6 +1,7 @@
 """Static, deterministic preparation of canonical image samples."""
 
 from dataclasses import dataclass
+from typing import Protocol
 
 import numpy as np
 
@@ -10,6 +11,51 @@ class Samples:
     x: np.ndarray
     y: np.ndarray
     sample_ids: np.ndarray
+
+    @property
+    def sample_count(self) -> int:
+        return len(self.x)
+
+    @property
+    def input_shape(self) -> tuple[int, ...]:
+        return tuple(self.x.shape[1:])
+
+    def take(self, indices: np.ndarray) -> "Samples":
+        return Samples(
+            self.x[indices],
+            self.y[indices],
+            self.sample_ids[indices],
+        )
+
+
+class SampleSource(Protocol):
+    """Random-access source materialized one physical batch at a time."""
+
+    @property
+    def sample_count(self) -> int: ...
+
+    @property
+    def input_shape(self) -> tuple[int, ...]: ...
+
+    def take(self, indices: np.ndarray) -> Samples: ...
+
+
+@dataclass(frozen=True, slots=True)
+class PreprocessedSampleSource:
+    source: SampleSource
+    preprocessor: "Preprocessor"
+
+    @property
+    def sample_count(self) -> int:
+        return self.source.sample_count
+
+    @property
+    def input_shape(self) -> tuple[int, ...]:
+        return self.preprocessor.input_shape
+
+    def take(self, indices: np.ndarray) -> Samples:
+        raw = self.source.take(indices)
+        return self.preprocessor.transform(raw.x, raw.y, sample_ids=raw.sample_ids)
 
 
 class Preprocessor:
@@ -37,8 +83,14 @@ class Preprocessor:
         ):
             raise ValueError("Invalid static preprocessing configuration")
 
-    def transform(self, images: np.ndarray, labels: np.ndarray) -> Samples:
-        """CIFAR canonical source is uint8 NCHW; ordinals follow source order."""
+    def transform(
+        self,
+        images: np.ndarray,
+        labels: np.ndarray,
+        *,
+        sample_ids: np.ndarray | None = None,
+    ) -> Samples:
+        """Normalize a nonempty uint8 NCHW image selection deterministically."""
         images = np.asarray(images)
         labels = np.asarray(labels)
         if images.dtype != np.uint8 or images.ndim != 4 or not len(images):
@@ -56,4 +108,10 @@ class Preprocessor:
         values = (values - self.mean[None, :, None, None]) / self.std[None, :, None, None]
         if not np.isfinite(values).all():
             raise ValueError("Nonfinite preprocessed values")
-        return Samples(values, labels.astype(np.int64), np.arange(len(images), dtype=np.int64))
+        if sample_ids is None:
+            ids = np.arange(len(images), dtype=np.int64)
+        else:
+            ids = np.asarray(sample_ids)
+            if ids.dtype != np.int64 or ids.shape != (len(images),):
+                raise ValueError("Invalid sample identities")
+        return Samples(values, labels.astype(np.int64), ids)

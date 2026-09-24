@@ -12,6 +12,7 @@ from dataset_manager.config import DatasetManagerConfig
 def main() -> None:
     try:
         from dotenv import load_dotenv
+
         load_dotenv()
     except ImportError:
         pass

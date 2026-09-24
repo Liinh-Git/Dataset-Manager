@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -221,6 +222,12 @@ def test_hf_store_materialize_and_remote_verification(tmp_path: Path):
 
     assert published.dataset_build_id == config.dataset_build_id
     assert published.manifest_path.is_file()
+    expected_origin = (
+        f"https://huggingface.co/datasets/test/repo/resolve/main/"
+        f"dataset-builds/{config.dataset_build_id}"
+    )
+    assert published.artifact_base_url == expected_origin
+    assert published.root_manifest_path == "dataset-manifest.json"
 
     expected_root = f"dataset-builds/{config.dataset_build_id}/dataset-manifest.json"
     assert expected_root in api.files
@@ -259,6 +266,8 @@ def test_hf_store_cache_miss_and_corrupt_manifest(tmp_path: Path):
     loaded = store2.load("miss-build", expected_manifest_hash=good_hash)
     assert loaded.dataset_manifest_hash == good_hash
     assert loaded.manifest_path.is_file()
+    assert loaded.artifact_base_url is not None
+    assert loaded.root_manifest_path == "dataset-manifest.json"
 
     rel_batch = "shards/000/batch-000000.npz"
     local_batch = store2.resolve_artifact(loaded, rel_batch)
@@ -508,7 +517,11 @@ def test_hf_store_purge_crash_recovery_when_remote_folder_already_absent(tmp_pat
     record_data = {
         "schema_version": DURABLE_RECORD_SCHEMA_VERSION,
         "dataset_build_id": build_id,
-        "request": {"shard_count": 2, "batch_size": 2, "profile": "cifar10_quick"},
+        "request": {
+            "shard_count": 3,
+            "batch_size": 2,
+            "profile": "CNN_IMAGE_CLASSIFICATION_V1",
+        },
         "request_fingerprint": "fp-crash",
         "idempotency_key_hash": sha256_bytes(b"key-crash"),
         "state": DatasetBuildState.DELETING.value,
@@ -577,3 +590,27 @@ def test_hf_store_resolve_artifact_corrupt_cache_hit_self_heals(tmp_path: Path):
     healed_path = store.resolve_artifact(published, rel_batch)
     assert healed_path.is_file()
     assert healed_path.read_bytes() == valid_bytes
+
+
+def test_hf_store_concurrent_cache_miss_publishes_complete_bytes(tmp_path: Path):
+    """Readers sharing one process never observe a partial HF cache fill."""
+    api = FakeHfApi()
+    store = HuggingFaceArtifactStore(
+        local_root=tmp_path / "store", repo_id="test/repo", token="fake", api=api
+    )
+    config = _sample_build_config("concurrent-cache-build")
+    published = store.materialize(config, _sample_data(8))
+    relative = "shards/000/batch-000000.npz"
+    path = store.resolve_artifact(published, relative)
+    expected = path.read_bytes()
+    path.unlink()
+
+    def fetch() -> bytes:
+        return store.resolve_artifact(published, relative).read_bytes()
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(lambda _index: fetch(), range(16)))
+
+    assert all(content == expected for content in results)
+    assert path.read_bytes() == expected
+    assert not list(path.parent.glob(f".{path.name}.*.tmp"))
